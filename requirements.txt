@@ -5,3 +5,6 @@ Pillow==13.0.0
 numpy
 tensorflow==2.21.0
 opencv-python-headless
+lime==0.2.0.1
+shap==0.48.0
+scikit-image
