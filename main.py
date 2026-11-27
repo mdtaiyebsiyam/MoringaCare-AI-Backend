@@ -1,4 +1,11 @@
 
+# MoringaCare AI Backend - Stable Grad-CAM Only Version
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
 from pathlib import Path
 from io import BytesIO
 import uuid
@@ -6,15 +13,11 @@ import uuid
 import cv2
 import numpy as np
 import tensorflow as tf
-
-from lime.lime_image import LimeImageExplainer
-from skimage.segmentation import mark_boundaries
 from PIL import Image, UnidentifiedImageError
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-
 
 # ============================================================
 # 1. PATHS AND CONFIGURATION
@@ -40,36 +43,34 @@ DISPLAY_NAMES = {
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 IMAGE_SIZE = (224, 224)
 
-LIME_NUM_SAMPLES = 100
-LIME_BATCH_SIZE = 16
-
-for directory in (STATIC_DIR, XAI_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+XAI_DIR.mkdir(parents=True, exist_ok=True)
 
 if not MODEL_PATH.is_file():
     raise RuntimeError(f"Model file not found: {MODEL_PATH}")
 
-
 # ============================================================
-# 2. FASTAPI APPLICATION
+# 2. FASTAPI APPLICATION AND CORS
 # ============================================================
 
 app = FastAPI(
     title="MoringaCare AI API",
     description="Hybrid CNN-Transformer based Moringa Leaf Disease Detection",
-    version="3.1.0",
+    version="3.2.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://moringacare-ai.vercel.app",
         "http://localhost:8443",
         "http://127.0.0.1:8443",
-        "https://moringacare-ai.vercel.app",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
     ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.vercel\.app",
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -79,10 +80,20 @@ app.mount(
     name="static",
 )
 
+# ============================================================
+# 3. TENSORFLOW CPU CONFIGURATION AND MODEL LOADING
+# ============================================================
 
-# ============================================================
-# 3. LOAD TRAINED MODEL
-# ============================================================
+try:
+    tf.config.set_visible_devices([], "GPU")
+except RuntimeError:
+    pass
+
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(2)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except RuntimeError:
+    pass
 
 model = tf.keras.models.load_model(
     MODEL_PATH,
@@ -95,20 +106,22 @@ if tuple(model.input_shape) != (None, 224, 224, 3):
 if model.output_shape[-1] != len(CLASS_NAMES):
     raise RuntimeError("Model output count does not match CLASS_NAMES.")
 
-# Keep the previously working Grad-CAM architecture.
+try:
+    grad_layer = model.get_layer("reshape")
+except ValueError as exc:
+    raise RuntimeError(
+        "Grad-CAM layer 'reshape' was not found in the trained model."
+    ) from exc
+
 grad_model = tf.keras.Model(
     inputs=model.inputs,
-    outputs=[
-        model.get_layer("reshape").input,
-        model.output,
-    ],
+    outputs=[grad_layer.input, model.output],
 )
 
 print("MoringaCare AI model loaded successfully!")
 print("Model input:", model.input_shape)
 print("Model output:", model.output_shape)
-print("Dynamic Grad-CAM and LIME initialized! SHAP is temporarily disabled.")
-
+print("Grad-CAM initialized in CPU mode.")
 
 # ============================================================
 # 4. IMAGE PREPROCESSING
@@ -122,12 +135,8 @@ def preprocess_image(image_bytes: bytes) -> tf.Tensor:
                 IMAGE_SIZE,
                 Image.Resampling.BILINEAR,
             )
-            image_array = np.asarray(
-                image,
-                dtype=np.float32,
-            )
+            image_array = np.asarray(image, dtype=np.float32)
 
-        # Keep 0-255 pixel scale.
         return tf.convert_to_tensor(
             image_array[None, ...],
             dtype=tf.float32,
@@ -143,29 +152,9 @@ def preprocess_image(image_bytes: bytes) -> tf.Tensor:
             detail="Invalid image. Please upload JPG, PNG, or WEBP.",
         ) from exc
 
-
-def predict_probabilities(images: np.ndarray) -> np.ndarray:
-    batch = np.asarray(images, dtype=np.float32)
-
-    if batch.ndim == 3:
-        batch = np.expand_dims(batch, axis=0)
-
-    probabilities = model.predict(
-        batch,
-        batch_size=LIME_BATCH_SIZE,
-        verbose=0,
-    )
-
-    probabilities = np.asarray(
-        probabilities,
-        dtype=np.float32,
-    )
-
-    if probabilities.ndim != 2:
-        raise RuntimeError("Unexpected model prediction shape.")
-
-    return probabilities
-
+# ============================================================
+# 5. SAVE EXPLANATION IMAGES
+# ============================================================
 
 def save_rgb_image(array: np.ndarray, filename: str) -> str:
     path = XAI_DIR / filename
@@ -175,13 +164,12 @@ def save_rgb_image(array: np.ndarray, filename: str) -> str:
     ).save(path, format="PNG")
 
     if not path.is_file():
-        raise RuntimeError("Could not save explanation image.")
+        raise RuntimeError("Could not save Grad-CAM image.")
 
     return f"/static/xai/{filename}"
 
-
 # ============================================================
-# 5. DYNAMIC GRAD-CAM
+# 6. DYNAMIC GRAD-CAM
 # ============================================================
 
 def generate_gradcam(
@@ -194,16 +182,12 @@ def generate_gradcam(
             image_tensor,
             training=False,
         )
-
         class_score = predictions[:, class_index]
 
-    gradients = tape.gradient(
-        class_score,
-        feature_maps,
-    )
+    gradients = tape.gradient(class_score, feature_maps)
 
     if gradients is None:
-        raise RuntimeError("Grad-CAM gradients unavailable.")
+        raise RuntimeError("Grad-CAM gradients are unavailable.")
 
     channel_weights = tf.reduce_mean(
         gradients,
@@ -217,10 +201,8 @@ def generate_gradcam(
     )
 
     heatmap = tf.maximum(heatmap, 0)
-
     heatmap = heatmap / (
-        tf.reduce_max(heatmap)
-        + tf.keras.backend.epsilon()
+        tf.reduce_max(heatmap) + tf.keras.backend.epsilon()
     )
 
     return heatmap.numpy()
@@ -241,7 +223,6 @@ def save_gradcam_images(
         IMAGE_SIZE,
         interpolation=cv2.INTER_CUBIC,
     )
-
     heatmap = np.clip(heatmap, 0, 1)
 
     heatmap_rgb = cv2.cvtColor(
@@ -279,111 +260,33 @@ def save_gradcam_images(
         ),
     }
 
-
 # ============================================================
-# 6. DYNAMIC LIME
-# ============================================================
-
-def generate_lime(
-    image_tensor: tf.Tensor,
-    class_index: int,
-) -> dict:
-
-    image_rgb = np.clip(
-        image_tensor[0].numpy(),
-        0,
-        255,
-    ).astype(np.uint8)
-
-    explainer = LimeImageExplainer(
-        random_state=42,
-    )
-
-    lime_input = image_rgb.astype(np.float32) / 255.0
-
-    def lime_classifier(images):
-        model_images = np.clip(
-            np.asarray(images, dtype=np.float32) * 255.0,
-            0,
-            255,
-        )
-
-        return predict_probabilities(model_images)
-
-    explanation = explainer.explain_instance(
-        image=lime_input,
-        classifier_fn=lime_classifier,
-        labels=(class_index,),
-        top_labels=None,
-        hide_color=0,
-        num_samples=LIME_NUM_SAMPLES,
-        batch_size=LIME_BATCH_SIZE,
-    )
-
-    explained_image, segments = explanation.get_image_and_mask(
-        label=class_index,
-        positive_only=False,
-        num_features=8,
-        hide_rest=False,
-    )
-
-    lime_visual = mark_boundaries(
-        np.clip(explained_image, 0, 1),
-        segments,
-        color=(1, 1, 0),
-        mode="thick",
-    )
-
-    lime_visual = np.uint8(
-        np.clip(lime_visual, 0, 1) * 255
-    )
-
-    filename = f"{uuid.uuid4().hex}_lime.png"
-
-    return {
-        "lime": save_rgb_image(
-            lime_visual,
-            filename,
-        ),
-    }
-
-
-# ============================================================
-# 7. HOME ROUTE
+# 7. BASIC ROUTES
 # ============================================================
 
 @app.get("/")
 def home():
-
     return {
         "message": "Welcome to MoringaCare AI API",
         "status": "Backend is running",
-        "version": "3.1.0",
+        "version": "3.2.0",
+        "xai": "Dynamic Grad-CAM only",
     }
 
 
-# ============================================================
-# 8. HEALTH CHECK
-# ============================================================
-
 @app.get("/health")
 def health():
-
     return {
         "status": "healthy",
         "model_loaded": model is not None,
         "gradcam_enabled": grad_model is not None,
-        "lime_enabled": True,
-        "shap_enabled": False,
-        "xai_mode": "dynamic_gradcam_lime",
-        "xai_images_available": len(
-            list(XAI_DIR.glob("*.png"))
-        ),
+        "gradcam_mode": "dynamic_unique_urls",
+        "runtime": "CPU",
+        "xai_images_available": len(list(XAI_DIR.glob("*.png"))),
     }
 
-
 # ============================================================
-# 9. PREDICTION API
+# 8. PREDICTION API
 # ============================================================
 
 @app.post("/predict")
@@ -405,46 +308,31 @@ async def predict(file: UploadFile = File(...)):
 
     try:
         with Image.open(BytesIO(image_bytes)) as uploaded_image:
-
-            if uploaded_image.format not in (
-                "JPEG",
-                "PNG",
-                "WEBP",
-            ):
+            if uploaded_image.format not in ("JPEG", "PNG", "WEBP"):
                 raise HTTPException(
                     status_code=400,
                     detail="Please upload JPG, PNG, or WEBP.",
                 )
-
             uploaded_image.verify()
 
     except HTTPException:
         raise
-
     except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail="Invalid or corrupted image file.",
         ) from exc
 
-    processed_image = preprocess_image(
-        image_bytes,
-    )
+    processed_image = preprocess_image(image_bytes)
 
     predictions = model.predict(
         processed_image,
         verbose=0,
     )
 
-    predicted_index = int(
-        np.argmax(predictions[0])
-    )
-
+    predicted_index = int(np.argmax(predictions[0]))
     predicted_class = CLASS_NAMES[predicted_index]
-
-    confidence = float(
-        predictions[0][predicted_index]
-    )
+    confidence = float(predictions[0][predicted_index])
 
     all_predictions = {
         CLASS_NAMES[index]: round(
@@ -454,38 +342,17 @@ async def predict(file: UploadFile = File(...)):
         for index in range(len(CLASS_NAMES))
     }
 
-    # Generate all explanations for this uploaded image.
     try:
-
-        explanations = {}
-
-        explanations.update(
-            save_gradcam_images(
-                processed_image,
-                predicted_index,
-            )
-        )
-
-        explanations.update(
-            generate_lime(
-                processed_image,
-                predicted_index,
-            )
+        explanations = save_gradcam_images(
+            processed_image,
+            predicted_index,
         )
 
     except Exception as exc:
-
-        print(
-            "XAI generation error:",
-            repr(exc),
-        )
-
+        print("Grad-CAM generation error:", repr(exc))
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Prediction was made, but Grad-CAM/LIME generation failed. "
-                "Check Render logs."
-            ),
+            detail="Prediction completed, but Grad-CAM generation failed. Please try another image.",
         ) from exc
 
     return {
@@ -497,16 +364,10 @@ async def predict(file: UploadFile = File(...)):
         "explanations": explanations,
     }
 
-
 # ============================================================
-# 10. SERVER INFORMATION
+# 9. STARTUP INFORMATION
 # ============================================================
 
 print("XAI directory:", XAI_DIR)
-
-print(
-    "Available XAI images:",
-    len(list(XAI_DIR.glob("*.png"))),
-)
-
+print("Available Grad-CAM images:", len(list(XAI_DIR.glob("*.png"))))
 print("MoringaCare AI API initialization completed!")
