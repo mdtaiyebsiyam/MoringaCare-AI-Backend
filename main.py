@@ -1,14 +1,20 @@
 
-# MoringaCare AI Backend - Stable Grad-CAM Only Version
+# MoringaCare AI Backend - Memory Optimized Grad-CAM Version
 
 import os
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
 
 from pathlib import Path
 from io import BytesIO
 import uuid
+import gc
+import threading
 
 import cv2
 import numpy as np
@@ -19,6 +25,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+
 # ============================================================
 # 1. PATHS AND CONFIGURATION
 # ============================================================
@@ -26,6 +33,7 @@ from fastapi.staticfiles import StaticFiles
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 XAI_DIR = STATIC_DIR / "xai"
+
 MODEL_PATH = BASE_DIR / "models" / "Hybrid_CNN_Transformer_Final.keras"
 
 CLASS_NAMES = [
@@ -49,6 +57,7 @@ XAI_DIR.mkdir(parents=True, exist_ok=True)
 if not MODEL_PATH.is_file():
     raise RuntimeError(f"Model file not found: {MODEL_PATH}")
 
+
 # ============================================================
 # 2. FASTAPI APPLICATION AND CORS
 # ============================================================
@@ -56,7 +65,7 @@ if not MODEL_PATH.is_file():
 app = FastAPI(
     title="MoringaCare AI API",
     description="Hybrid CNN-Transformer based Moringa Leaf Disease Detection",
-    version="3.2.0",
+    version="3.3.0",
 )
 
 app.add_middleware(
@@ -80,6 +89,7 @@ app.mount(
     name="static",
 )
 
+
 # ============================================================
 # 3. TENSORFLOW CPU CONFIGURATION AND MODEL LOADING
 # ============================================================
@@ -90,7 +100,7 @@ except RuntimeError:
     pass
 
 try:
-    tf.config.threading.set_intra_op_parallelism_threads(2)
+    tf.config.threading.set_intra_op_parallelism_threads(1)
     tf.config.threading.set_inter_op_parallelism_threads(1)
 except RuntimeError:
     pass
@@ -101,10 +111,14 @@ model = tf.keras.models.load_model(
 )
 
 if tuple(model.input_shape) != (None, 224, 224, 3):
-    raise RuntimeError(f"Unexpected model input shape: {model.input_shape}")
+    raise RuntimeError(
+        f"Unexpected model input shape: {model.input_shape}"
+    )
 
 if model.output_shape[-1] != len(CLASS_NAMES):
-    raise RuntimeError("Model output count does not match CLASS_NAMES.")
+    raise RuntimeError(
+        "Model output count does not match CLASS_NAMES."
+    )
 
 try:
     grad_layer = model.get_layer("reshape")
@@ -118,24 +132,35 @@ grad_model = tf.keras.Model(
     outputs=[grad_layer.input, model.output],
 )
 
+# Prevent concurrent inference requests from causing RAM spikes.
+INFERENCE_LOCK = threading.Lock()
+
 print("MoringaCare AI model loaded successfully!")
 print("Model input:", model.input_shape)
 print("Model output:", model.output_shape)
-print("Grad-CAM initialized in CPU mode.")
+print("Grad-CAM initialized in CPU mode (single-pass inference).")
+
 
 # ============================================================
 # 4. IMAGE PREPROCESSING
 # ============================================================
 
 def preprocess_image(image_bytes: bytes) -> tf.Tensor:
+
     try:
         with Image.open(BytesIO(image_bytes)) as image:
+
             image = image.convert("RGB")
+
             image = image.resize(
                 IMAGE_SIZE,
                 Image.Resampling.BILINEAR,
             )
-            image_array = np.asarray(image, dtype=np.float32)
+
+            image_array = np.asarray(
+                image,
+                dtype=np.float32,
+            )
 
         return tf.convert_to_tensor(
             image_array[None, ...],
@@ -147,47 +172,73 @@ def preprocess_image(image_bytes: bytes) -> tf.Tensor:
         OSError,
         ValueError,
     ) as exc:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid image. Please upload JPG, PNG, or WEBP.",
         ) from exc
 
+
 # ============================================================
 # 5. SAVE EXPLANATION IMAGES
 # ============================================================
 
-def save_rgb_image(array: np.ndarray, filename: str) -> str:
+def save_rgb_image(
+    array: np.ndarray,
+    filename: str,
+) -> str:
+
     path = XAI_DIR / filename
 
     Image.fromarray(
         np.asarray(array, dtype=np.uint8)
-    ).save(path, format="PNG")
+    ).save(
+        path,
+        format="PNG",
+    )
 
     if not path.is_file():
-        raise RuntimeError("Could not save Grad-CAM image.")
+        raise RuntimeError(
+            "Could not save Grad-CAM image."
+        )
 
     return f"/static/xai/{filename}"
 
+
 # ============================================================
-# 6. DYNAMIC GRAD-CAM
+# 6. DYNAMIC GRAD-CAM - SINGLE FORWARD PASS
 # ============================================================
 
-def generate_gradcam(
+def predict_and_generate_gradcam(
     image_tensor: tf.Tensor,
-    class_index: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
+
+    """
+    Run the model once and calculate Grad-CAM
+    from the same forward pass.
+    """
 
     with tf.GradientTape() as tape:
+
         feature_maps, predictions = grad_model(
             image_tensor,
             training=False,
         )
-        class_score = predictions[:, class_index]
 
-    gradients = tape.gradient(class_score, feature_maps)
+        class_score = tf.reduce_max(
+            predictions,
+            axis=1,
+        )
+
+    gradients = tape.gradient(
+        class_score,
+        feature_maps,
+    )
 
     if gradients is None:
-        raise RuntimeError("Grad-CAM gradients are unavailable.")
+        raise RuntimeError(
+            "Grad-CAM gradients are unavailable."
+        )
 
     channel_weights = tf.reduce_mean(
         gradients,
@@ -200,30 +251,40 @@ def generate_gradcam(
         axis=-1,
     )
 
-    heatmap = tf.maximum(heatmap, 0)
-    heatmap = heatmap / (
-        tf.reduce_max(heatmap) + tf.keras.backend.epsilon()
+    heatmap = tf.maximum(
+        heatmap,
+        0.0,
     )
 
-    return heatmap.numpy()
+    heatmap = heatmap / (
+        tf.reduce_max(heatmap)
+        + tf.keras.backend.epsilon()
+    )
+
+    predictions_array = predictions[0].numpy()
+    heatmap_array = heatmap.numpy()
+
+    return predictions_array, heatmap_array
 
 
 def save_gradcam_images(
     image_tensor: tf.Tensor,
-    class_index: int,
+    heatmap: np.ndarray,
 ) -> dict:
 
-    heatmap = generate_gradcam(
-        image_tensor,
-        class_index,
-    )
+    """Create and save dynamic Grad-CAM images."""
 
     heatmap = cv2.resize(
         heatmap.astype(np.float32),
         IMAGE_SIZE,
-        interpolation=cv2.INTER_CUBIC,
+        interpolation=cv2.INTER_LINEAR,
     )
-    heatmap = np.clip(heatmap, 0, 1)
+
+    heatmap = np.clip(
+        heatmap,
+        0.0,
+        1.0,
+    )
 
     heatmap_rgb = cv2.cvtColor(
         cv2.applyColorMap(
@@ -249,16 +310,25 @@ def save_gradcam_images(
 
     prediction_id = uuid.uuid4().hex
 
-    return {
+    result = {
         "gradcam_heatmap": save_rgb_image(
             heatmap_rgb,
             f"{prediction_id}_gradcam_heatmap.png",
         ),
+
         "gradcam_overlay": save_rgb_image(
             overlay_rgb,
             f"{prediction_id}_gradcam_overlay.png",
         ),
     }
+
+    del heatmap_rgb
+    del original_rgb
+    del overlay_rgb
+    del heatmap
+
+    return result
+
 
 # ============================================================
 # 7. BASIC ROUTES
@@ -266,31 +336,38 @@ def save_gradcam_images(
 
 @app.get("/")
 def home():
+
     return {
         "message": "Welcome to MoringaCare AI API",
         "status": "Backend is running",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "xai": "Dynamic Grad-CAM only",
     }
 
 
 @app.get("/health")
 def health():
+
     return {
         "status": "healthy",
         "model_loaded": model is not None,
         "gradcam_enabled": grad_model is not None,
         "gradcam_mode": "dynamic_unique_urls",
         "runtime": "CPU",
-        "xai_images_available": len(list(XAI_DIR.glob("*.png"))),
+        "xai_images_available": len(
+            list(XAI_DIR.glob("*.png"))
+        ),
     }
+
 
 # ============================================================
 # 8. PREDICTION API
 # ============================================================
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file: UploadFile = File(...),
+):
 
     image_bytes = await file.read()
 
@@ -307,67 +384,126 @@ async def predict(file: UploadFile = File(...)):
         )
 
     try:
-        with Image.open(BytesIO(image_bytes)) as uploaded_image:
-            if uploaded_image.format not in ("JPEG", "PNG", "WEBP"):
+
+        with Image.open(
+            BytesIO(image_bytes)
+        ) as uploaded_image:
+
+            if uploaded_image.format not in (
+                "JPEG",
+                "PNG",
+                "WEBP",
+            ):
+
                 raise HTTPException(
                     status_code=400,
                     detail="Please upload JPG, PNG, or WEBP.",
                 )
+
             uploaded_image.verify()
 
     except HTTPException:
         raise
+
     except Exception as exc:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid or corrupted image file.",
         ) from exc
 
-    processed_image = preprocess_image(image_bytes)
-
-    predictions = model.predict(
-        processed_image,
-        verbose=0,
+    processed_image = preprocess_image(
+        image_bytes
     )
 
-    predicted_index = int(np.argmax(predictions[0]))
-    predicted_class = CLASS_NAMES[predicted_index]
-    confidence = float(predictions[0][predicted_index])
+    # Serialize model execution on low-memory hosting.
+    with INFERENCE_LOCK:
 
-    all_predictions = {
-        CLASS_NAMES[index]: round(
-            float(predictions[0][index]) * 100,
-            2,
-        )
-        for index in range(len(CLASS_NAMES))
-    }
+        try:
 
-    try:
-        explanations = save_gradcam_images(
-            processed_image,
-            predicted_index,
-        )
+            predictions, heatmap = (
+                predict_and_generate_gradcam(
+                    processed_image
+                )
+            )
 
-    except Exception as exc:
-        print("Grad-CAM generation error:", repr(exc))
-        raise HTTPException(
-            status_code=500,
-            detail="Prediction completed, but Grad-CAM generation failed. Please try another image.",
-        ) from exc
+            predicted_index = int(
+                np.argmax(predictions)
+            )
 
-    return {
-        "success": True,
-        "predicted_class": predicted_class,
-        "disease_name": DISPLAY_NAMES[predicted_class],
-        "confidence": round(confidence * 100, 2),
-        "all_predictions": all_predictions,
-        "explanations": explanations,
-    }
+            predicted_class = CLASS_NAMES[
+                predicted_index
+            ]
+
+            confidence = float(
+                predictions[predicted_index]
+            )
+
+            all_predictions = {
+                CLASS_NAMES[index]: round(
+                    float(predictions[index]) * 100,
+                    2,
+                )
+                for index in range(len(CLASS_NAMES))
+            }
+
+            explanations = save_gradcam_images(
+                processed_image,
+                heatmap,
+            )
+
+            response_data = {
+                "success": True,
+                "predicted_class": predicted_class,
+                "disease_name": DISPLAY_NAMES[
+                    predicted_class
+                ],
+                "confidence": round(
+                    confidence * 100,
+                    2,
+                ),
+                "all_predictions": all_predictions,
+                "explanations": explanations,
+            }
+
+            del predictions
+            del heatmap
+            del processed_image
+
+            gc.collect()
+
+            return response_data
+
+        except HTTPException:
+            raise
+
+        except Exception as exc:
+
+            print(
+                "Prediction/Grad-CAM generation error:",
+                repr(exc),
+            )
+
+            gc.collect()
+
+            raise HTTPException(
+                status_code=500,
+                detail="Prediction or Grad-CAM generation failed. Please try again.",
+            ) from exc
+
 
 # ============================================================
 # 9. STARTUP INFORMATION
 # ============================================================
 
 print("XAI directory:", XAI_DIR)
-print("Available Grad-CAM images:", len(list(XAI_DIR.glob("*.png"))))
-print("MoringaCare AI API initialization completed!")
+
+print(
+    "Available Grad-CAM images:",
+    len(list(XAI_DIR.glob("*.png"))),
+)
+
+print(
+    "MoringaCare AI API initialization completed "
+    "(memory-optimized single-pass mode)!"
+)
